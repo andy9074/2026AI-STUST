@@ -59,6 +59,11 @@ CHAT_LOG_SHOW = 7              # 右下視窗顯示幾則
 CHAT_PANEL_W = 340
 CHAT_PANEL_H = 220
 
+# 擊殺公告
+KILL_FEED_MAX = 10
+KILL_FEED_SHOW = 5             # 螢幕右上顯示幾則
+KILL_FEED_DURATION = 6.0       # 每則存活秒數
+
 # 大廳 / 選單可選項
 SHAPES = ["circle", "square", "triangle"]
 COLORS = [

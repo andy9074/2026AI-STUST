@@ -15,6 +15,7 @@ from constants import (
     CHAT_LOG_SHOW, CHAT_PANEL_W, CHAT_PANEL_H,
     BUFF_COLORS, BUFF_LABELS, BUFF_ZH,
     SUPER_PREFIX,
+    KILL_FEED_SHOW, KILL_FEED_DURATION,
 )
 
 
@@ -50,7 +51,7 @@ def run_game(sock, config):
     my_id = config["id"]
     my_x, my_y = WORLD_W / 2, WORLD_H / 2
 
-    latest = {"players": [], "bullets": [], "pickups": [], "orbits": [], "chat_log": []}
+    latest = {"players": [], "bullets": [], "pickups": [], "orbits": [], "chat_log": [], "kill_feed": []}
     state_lock = threading.Lock()
     running = True
 
@@ -82,11 +83,12 @@ def run_game(sock, config):
                     continue
                 if msg.get("type") == "state":
                     with state_lock:
-                        latest["players"]  = msg.get("players", [])
-                        latest["bullets"]  = msg.get("bullets", [])
-                        latest["pickups"]  = msg.get("pickups", [])
-                        latest["orbits"]   = msg.get("orbits", [])
-                        latest["chat_log"] = msg.get("chat_log", [])
+                        latest["players"]   = msg.get("players", [])
+                        latest["bullets"]   = msg.get("bullets", [])
+                        latest["pickups"]   = msg.get("pickups", [])
+                        latest["orbits"]    = msg.get("orbits", [])
+                        latest["chat_log"]  = msg.get("chat_log", [])
+                        latest["kill_feed"] = msg.get("kill_feed", [])
 
     threading.Thread(target=recv_loop, daemon=True).start()
 
@@ -159,6 +161,7 @@ def run_game(sock, config):
                 pickups_snap = list(latest["pickups"])
                 orbits_snap  = list(latest["orbits"])
                 chat_log     = list(latest["chat_log"])
+                kill_feed    = list(latest["kill_feed"])
 
             me = find_me(players_snap)
             alive = (me is None) or me.get("alive", True)
@@ -198,13 +201,13 @@ def run_game(sock, config):
                 elif event.type == pygame.TEXTINPUT and chat_active:
                     chat_text += event.text
 
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                    if alive and not chat_active:
-                        mx, my = event.pos
-                        dx = mx - SCREEN_W / 2
-                        dy = my - SCREEN_H / 2
-                        if dx * dx + dy * dy > 4:
-                            send({"type": "shoot", "dx": dx, "dy": dy})
+            # 持續按住左鍵 → 自動連射（實際射速由 server 的冷卻限制）
+            if alive and not chat_active and pygame.mouse.get_pressed()[0]:
+                mx, my = pygame.mouse.get_pos()
+                dx = mx - SCREEN_W / 2
+                dy = my - SCREEN_H / 2
+                if dx * dx + dy * dy > 4:
+                    send({"type": "shoot", "dx": dx, "dy": dy})
 
             # 移動
             if alive and not chat_active:
@@ -338,27 +341,55 @@ def run_game(sock, config):
                 screen.blit(hp_text, (16, 13))
 
             # 我的 Buff 條列（左上血條下方）
-            if my_buffs:
-                y = 44
-                for name, remaining in my_buffs.items():
-                    if name == "hp" or remaining <= 0:
-                        continue
-                    col = BUFF_COLORS.get(name, (200, 200, 200))
-                    pygame.draw.circle(screen, col, (20, y + 10), 9)
-                    pygame.draw.circle(screen, (0, 0, 0), (20, y + 10), 9, 1)
-                    label_txt = f"{BUFF_ZH.get(name, name)}  {remaining:.1f}s"
-                    t = font.render(label_txt, True, (255, 255, 255))
-                    # 描邊背景
-                    bg = pygame.Rect(32, y + 2, t.get_width() + 8, 20)
-                    s = pygame.Surface((bg.w, bg.h), pygame.SRCALPHA)
-                    s.fill((0, 0, 0, 130))
-                    screen.blit(s, bg.topleft)
-                    screen.blit(t, (36, y + 3))
-                    y += 22
+            y = 44
+            def draw_buff_row(y, col, text):
+                pygame.draw.circle(screen, col, (20, y + 10), 9)
+                pygame.draw.circle(screen, (0, 0, 0), (20, y + 10), 9, 1)
+                t = font.render(text, True, (255, 255, 255))
+                bg = pygame.Rect(32, y + 2, t.get_width() + 8, 20)
+                s = pygame.Surface((bg.w, bg.h), pygame.SRCALPHA)
+                s.fill((0, 0, 0, 130))
+                screen.blit(s, bg.topleft)
+                screen.blit(t, (36, y + 3))
+                return y + 22
+
+            if me and me.get("rapid_forever"):
+                y = draw_buff_row(y, BUFF_COLORS["rapid"], "快速射擊  ∞")
+            for name, remaining in my_buffs.items():
+                if name == "hp" or remaining <= 0:
+                    continue
+                y = draw_buff_row(y, BUFF_COLORS.get(name, (200, 200, 200)),
+                                  f"{BUFF_ZH.get(name, name)}  {remaining:.1f}s")
 
             # 玩家數
             cnt = font.render(f"線上：{len(players_snap)}", True, (0, 0, 0))
             screen.blit(cnt, (SCREEN_W - cnt.get_width() - 10, 10))
+
+            # 擊殺公告（右上，往下堆疊，過期淡出）
+            visible = [k for k in kill_feed[-KILL_FEED_SHOW:] if now - k.get("ts", 0) < KILL_FEED_DURATION]
+            fy = 34
+            for k in reversed(visible):
+                age = now - k.get("ts", 0)
+                alpha = 255 if age < KILL_FEED_DURATION - 1 else max(0, int(255 * (KILL_FEED_DURATION - age)))
+                killer_name = (SUPER_PREFIX if k.get("killer_super") else "") + k.get("killer", "?")
+                victim_name = (SUPER_PREFIX if k.get("victim_super") else "") + k.get("victim", "?")
+                kc = tuple(k.get("killer_color", (220, 60, 60)))
+                vc = tuple(k.get("victim_color", (60, 60, 220)))
+                s_kill = font.render(killer_name, True, kc)
+                s_mid  = font.render(" 擊殺了 ", True, (255, 255, 255))
+                s_vic  = font.render(victim_name, True, vc)
+                total_w = s_kill.get_width() + s_mid.get_width() + s_vic.get_width() + 16
+                panel = pygame.Surface((total_w, 24), pygame.SRCALPHA)
+                panel.fill((0, 0, 0, min(alpha, 170)))
+                for surf in (s_kill, s_mid, s_vic):
+                    surf.set_alpha(alpha)
+                px = SCREEN_W - total_w - 10
+                screen.blit(panel, (px, fy))
+                cx = px + 8
+                screen.blit(s_kill, (cx, fy + 4)); cx += s_kill.get_width()
+                screen.blit(s_mid,  (cx, fy + 4)); cx += s_mid.get_width()
+                screen.blit(s_vic,  (cx, fy + 4))
+                fy += 28
 
             # ====== 右下角半透明聊天視窗 ======
             panel_x = SCREEN_W - CHAT_PANEL_W - 10

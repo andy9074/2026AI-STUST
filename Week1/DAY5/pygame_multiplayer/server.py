@@ -25,6 +25,7 @@ from constants import (
     HOMING_TURN_RATE, HOMING_RANGE,
     CHAT_LOG_MAX,
     SUPER_REGEN, SUPER_REGEN_INTERVAL,
+    KILL_FEED_MAX,
 )
 
 HOST = "0.0.0.0"
@@ -34,6 +35,7 @@ players = {}   # {cid: player_dict}
 bullets = []
 pickups = []
 chat_log = collections.deque(maxlen=CHAT_LOG_MAX)
+kill_feed = collections.deque(maxlen=KILL_FEED_MAX)
 lock = threading.Lock()
 
 bullet_id_counter = 0
@@ -41,6 +43,18 @@ pickup_id_counter = 0
 
 # (attacker_cid, victim_cid) -> next_hit_ts
 orbit_hit_cd = {}
+
+
+def 加擊殺公告(killer_p, victim_p, now):
+    kill_feed.append({
+        "killer":       killer_p["id"],
+        "killer_color": killer_p["color"],
+        "killer_super": killer_p.get("super", False),
+        "victim":       victim_p["id"],
+        "victim_color": victim_p["color"],
+        "victim_super": victim_p.get("super", False),
+        "ts":           now,
+    })
 
 
 class ClientConn:
@@ -95,7 +109,9 @@ def 隨機重生點():
 
 
 def 取得射擊冷卻(p, now):
-    return SHOOT_COOLDOWN_RAPID if now < p["buffs"].get("rapid", 0) else SHOOT_COOLDOWN
+    if p.get("rapid_forever") or now < p["buffs"].get("rapid", 0):
+        return SHOOT_COOLDOWN_RAPID
+    return SHOOT_COOLDOWN
 
 
 def 套用道具(p, ptype, now):
@@ -123,8 +139,9 @@ def 打包玩家(p, now):
         "size_bonus": p.get("size_bonus", 0),
         "chat":       p.get("chat", ""),
         "chat_time":  p.get("chat_time", 0),
-        "buffs":      remaining,
-        "super":      p.get("super", False),
+        "buffs":         remaining,
+        "super":         p.get("super", False),
+        "rapid_forever": p.get("rapid_forever", False),
     }
 
 
@@ -188,6 +205,9 @@ def 遊戲Tick():
                         if p["hp"] <= 0:
                             p["hp"] = 0
                             p["alive"] = False
+                            killer = players.get(b["owner"])
+                            if killer:
+                                加擊殺公告(killer, p, now)
                         bullets.remove(b)
                         break
 
@@ -219,6 +239,7 @@ def 遊戲Tick():
                                 if vp["hp"] <= 0:
                                     vp["hp"] = 0
                                     vp["alive"] = False
+                                    加擊殺公告(p, vp, now)
                                 orbit_hit_cd[key] = now + ORBIT_HIT_CD
 
             # === 3.5) 金手指 auto-regen ===
@@ -260,8 +281,9 @@ def 遊戲Tick():
                 "bullets":  [{"x": b["x"], "y": b["y"], "homing": b.get("homing", False)} for b in bullets],
                 "orbits":   orbit_snapshot,
                 "pickups":  [{"x": pk["x"], "y": pk["y"], "type": pk["type"]} for pk in pickups],
-                "chat_log": list(chat_log),
-                "now":      now,
+                "chat_log":  list(chat_log),
+                "kill_feed": list(kill_feed),
+                "now":       now,
             }
             client_list = list(conns_by_cid.values())
 
@@ -315,8 +337,9 @@ def 處理單一連線(conn, cid, addr):
                             "buffs":      {},
                             "chat": "", "chat_time": 0,
                             "shoot_cd_end": 0,
-                            "super":      False,
-                            "last_regen": 0,
+                            "super":         False,
+                            "last_regen":    0,
+                            "rapid_forever": False,
                         }
                         print(f"[{cid}] 加入為 {players[cid]['id']}")
 
@@ -349,11 +372,27 @@ def 處理單一連線(conn, cid, addr):
                         p = players[cid]
                         txt = str(msg.get("text", ""))[:80].strip()
                         if txt == "/super":
-                            p["super"] = not p.get("super", False)
-                            state_txt = "開啟" if p["super"] else "關閉"
+                            if not p.get("super", False):
+                                p["super"] = True
+                                chat_log.append({
+                                    "author": "系統",
+                                    "text":   f"{p['id']} 開啟 金手指模式",
+                                    "ts":     now,
+                                })
+                        elif txt == "/exitsuper":
+                            if p.get("super", False):
+                                p["super"] = False
+                                chat_log.append({
+                                    "author": "系統",
+                                    "text":   f"{p['id']} 關閉 金手指模式",
+                                    "ts":     now,
+                                })
+                        elif txt == "/快速射擊":
+                            p["rapid_forever"] = not p.get("rapid_forever", False)
+                            state_txt = "開啟" if p["rapid_forever"] else "關閉"
                             chat_log.append({
                                 "author": "系統",
-                                "text":   f"{p['id']} {state_txt} 金手指模式",
+                                "text":   f"{p['id']} {state_txt} 快速射擊模式",
                                 "ts":     now,
                             })
                         elif txt:
